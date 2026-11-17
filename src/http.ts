@@ -1,9 +1,10 @@
 // HTTP router: auth first, JSON bodies, request ids, and dispatch to the four surfaces.
+// Transport-independent: the caller hands it a parsed request and gets a reply object.
+// A raw node:net server (src/transport.ts) owns the bytes; this file owns the semantics.
 // Every reply is JSON (never HTML) and carries X-GitHub-Request-Id. /healthz is open;
 // everything else needs Authorization: Bearer <token> (the entry process's own
 // MAKEFUN_SHOP_TOKEN, or any non-empty bearer when the env var is unset in dev).
 
-import { type IncomingMessage, type ServerResponse } from 'node:http';
 import { handleGit } from './gitproto.ts';
 import { handleRest, NO_CONTENT } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -15,6 +16,22 @@ export interface AppOptions {
   token: string;
 }
 
+/** One parsed HTTP request, as the transport hands it over. Header names are lowercase. */
+export interface TransportRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+/** One reply, as the transport writes it. body is always a Buffer (possibly empty). */
+export interface TransportReply {
+  status: number;
+  contentType: string;
+  body: Buffer;
+  headers?: Record<string, string>;
+}
+
 let requestCounter = 0;
 
 function requestId(): string {
@@ -22,38 +39,17 @@ function requestId(): string {
   return `req-${process.pid}-${requestCounter}`;
 }
 
-function sendJson(res: ServerResponse, status: number, json: unknown, headers: Record<string, string> = {}): void {
-  const body = JSON.stringify(json);
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(body),
-    'x-github-request-id': requestId(),
-    ...headers,
-  });
-  res.end(body);
+function jsonReply(status: number, json: unknown, headers: Record<string, string> = {}): TransportReply {
+  const body = Buffer.from(JSON.stringify(json), 'utf8');
+  return { status, contentType: 'application/json', body, headers: { 'x-github-request-id': requestId(), ...headers } };
 }
 
-function sendNoContent(res: ServerResponse): void {
-  res.writeHead(NO_CONTENT, { 'x-github-request-id': requestId() });
-  res.end();
+function noContentReply(): TransportReply {
+  return { status: NO_CONTENT, contentType: '', body: Buffer.alloc(0), headers: { 'x-github-request-id': requestId() } };
 }
 
-function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': body.length,
-    'x-github-request-id': requestId(),
-  });
-  res.end(body);
-}
-
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+function rawReply(status: number, contentType: string, body: Buffer): TransportReply {
+  return { status, contentType, body, headers: { 'x-github-request-id': requestId() } };
 }
 
 function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -65,18 +61,17 @@ function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false 
   }
 }
 
-export function createHandler(options: AppOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+export function createDispatcher(options: AppOptions): (req: TransportRequest) => TransportReply {
   const { store, token } = options;
 
-  return async (req, res) => {
+  return (req) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const path = url.pathname;
     const method = (req.method ?? 'GET').toUpperCase();
 
     // ---- open health check
     if (path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
+      return jsonReply(200, { ok: true });
     }
 
     const isGit = path.endsWith('.git/info/refs') || path.endsWith('.git/git-upload-pack') || path.endsWith('.git/git-receive-pack');
@@ -85,32 +80,27 @@ export function createHandler(options: AppOptions): (req: IncomingMessage, res: 
     const isMcp = path === '/mcp';
 
     if (!isGit && !isRest && !isGraphQL && !isMcp) {
-      sendJson(res, 404, { message: 'Not Found' });
-      return;
+      return jsonReply(404, { message: 'Not Found' });
     }
 
-    const raw = await readBody(req);
+    const raw = req.body;
 
     // ---- MCP parses its body before auth: a malformed body is 400/-32700 even unauthenticated
     if (isMcp) {
       const parsed = parseJsonBody(raw);
       if (!parsed.ok) {
         const reply = mcpParseError();
-        sendJson(res, reply.status, reply.json);
-        return;
+        return jsonReply(reply.status, reply.json);
       }
       const auth = req.headers.authorization ?? '';
       if (!auth.startsWith('Bearer ') || auth.slice(7).trim() === '') {
-        sendJson(res, 401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
-        return;
+        return jsonReply(401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
       }
       if (token !== '' && auth.slice(7) !== token) {
-        sendJson(res, 401, { message: 'Bad credentials' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
-        return;
+        return jsonReply(401, { message: 'Bad credentials' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
       }
       const reply = handleMcp(store, parsed.value);
-      sendJson(res, reply.status, reply.json);
-      return;
+      return jsonReply(reply.status, reply.json);
     }
 
     // ---- auth for git / rest / graphql
@@ -131,8 +121,7 @@ export function createHandler(options: AppOptions): (req: IncomingMessage, res: 
       }
     }
     if (!authed) {
-      sendJson(res, 401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
-      return;
+      return jsonReply(401, { message: 'Requires authentication' }, { 'www-authenticate': 'Basic realm="Git Forge"' });
     }
 
     // ---- git smart HTTP (raw bodies, no JSON parsing)
@@ -145,25 +134,21 @@ export function createHandler(options: AppOptions): (req: IncomingMessage, res: 
       const query = url.searchParams;
       const repo = store.getRepo(owner, repoName);
       const reply = handleGit(store, repo, tail, method, query, raw, req.headers);
-      sendRaw(res, reply.status, reply.contentType, reply.body);
-      return;
+      return rawReply(reply.status, reply.contentType, reply.body);
     }
 
     // ---- REST + GraphQL share JSON body parsing (malformed JSON is 400)
     const parsed = parseJsonBody(raw);
     if (!parsed.ok) {
-      sendJson(res, 400, { message: 'Problems parsing JSON' });
-      return;
+      return jsonReply(400, { message: 'Problems parsing JSON' });
     }
 
     if (isGraphQL) {
       if (method !== 'POST') {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
+        return jsonReply(404, { message: 'Not Found' });
       }
       const reply = handleGraphQL(store, parsed.value);
-      sendJson(res, reply.status, reply.json);
-      return;
+      return jsonReply(reply.status, reply.json);
     }
 
     // ---- REST (segments after /api/v3)
@@ -172,9 +157,8 @@ export function createHandler(options: AppOptions): (req: IncomingMessage, res: 
     const origin = `http://${req.headers.host ?? 'localhost'}`;
     const reply = handleRest(store, method, segments, query, parsed.value, origin);
     if (reply.status === NO_CONTENT) {
-      sendNoContent(res);
-      return;
+      return noContentReply();
     }
-    sendJson(res, reply.status, reply.json, reply.headers ?? {});
+    return jsonReply(reply.status, reply.json, reply.headers ?? {});
   };
 }

@@ -354,24 +354,26 @@ export function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | und
           }
           baseOffset = entryStart - base;
         }
-        const end = findStreamEnd(pack, offset, trailerStart, header.size);
-        if (end < 0) return null;
-        const data = inflateSync(pack.subarray(offset, end));
+        const found = findStreamEnd(pack, offset, trailerStart, header.size);
+        if (found.end < 0) return null;
+        // Reuse the data findStreamEnd already inflated (its length matched and
+        // zlib validated the stream); inflate only if it fell back to the slow path.
+        const data = found.data ?? inflateSync(pack.subarray(offset, found.end));
         if (data.length !== header.size) return null;
         pending.push({ baseOid, baseOffset, data, start: entryStart });
-        offset = end;
+        offset = found.end;
         continue;
       }
       const type = CODE_TYPE[typeCode];
       if (type === undefined) return null;
-      const end = findStreamEnd(pack, offset, trailerStart, header.size);
-      if (end < 0) return null;
-      const data = inflateSync(pack.subarray(offset, end));
+      const found = findStreamEnd(pack, offset, trailerStart, header.size);
+      if (found.end < 0) return null;
+      const data = found.data ?? inflateSync(pack.subarray(offset, found.end));
       if (data.length !== header.size) return null;
       const object: GitObject = { type, data };
       objects.set(hashObject(type, data), object);
       byOffset.set(entryStart, object);
-      offset = end;
+      offset = found.end;
     }
     if (offset !== trailerStart) return null;
     // Resolve deltas; a delta's base may itself be a delta, so retry until no progress.
@@ -420,21 +422,24 @@ function adler32(data: Buffer): number {
 
 /**
  * The exact end of the zlib stream starting at `start`: the smallest end in
- * (start, limit] whose inflate yields exactly `size` bytes. -1 when no such end exists.
+ * (start, limit] whose inflate yields exactly `size` bytes, plus the data it
+ * inflates to. `end` -1 when no such end exists; `data` is null when the slow
+ * path ran, and the caller then inflates the stream itself.
  *
  * Fast path: inflate the whole remainder once (inflateSync returns the first stream's
  * data and ignores trailing bytes), then locate the stream end by its Adler-32 trailer
  * and verify it with a single inflate. A binary search over throwing probes costs
- * ~3 ms per pack; this costs one inflate plus one verification.
+ * ~3 ms per pack; this costs one inflate plus one verification. Returning the data
+ * saves the caller a third inflate per object.
  */
-function findStreamEnd(buffer: Buffer, start: number, limit: number, size: number): number {
+function findStreamEnd(buffer: Buffer, start: number, limit: number, size: number): { end: number; data: Buffer | null } {
   let data: Buffer;
   try {
     data = inflateSync(buffer.subarray(start, limit));
   } catch {
-    return findStreamEndSlow(buffer, start, limit, size);
+    return { end: findStreamEndSlow(buffer, start, limit, size), data: null };
   }
-  if (data.length !== size) return findStreamEndSlow(buffer, start, limit, size);
+  if (data.length !== size) return { end: findStreamEndSlow(buffer, start, limit, size), data: null };
   const needle = Buffer.alloc(4);
   needle.writeUInt32BE(adler32(data), 0);
   let from = start + 2; // past the 2-byte zlib header
@@ -443,13 +448,13 @@ function findStreamEnd(buffer: Buffer, start: number, limit: number, size: numbe
     if (at < 0 || at + 4 > limit) break;
     const end = at + 4;
     try {
-      if (inflateSync(buffer.subarray(start, end)).length === size) return end;
+      if (inflateSync(buffer.subarray(start, end)).length === size) return { end, data };
     } catch {
       // The Adler bytes occurred inside the deflate payload: keep scanning.
     }
     from = at + 1;
   }
-  return findStreamEndSlow(buffer, start, limit, size);
+  return { end: findStreamEndSlow(buffer, start, limit, size), data: null };
 }
 
 /**
