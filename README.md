@@ -1,5 +1,9 @@
 # GitForge — a GitHub-compatible git forge in pure Node.js
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/ipaludhi/gitforge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/ipaludhi/gitforge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A single-process, dependency-free git forge that speaks the real protocols:
 smart HTTP git (v0 + v2, with delta packs), REST v3, GraphQL v4, and MCP.
 One in-memory store backs all four surfaces, so a repo, issue, or pull request
