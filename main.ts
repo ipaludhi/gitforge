@@ -3,6 +3,9 @@
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
 // (Authored note: this file is deliberately thin — every behaviour lives in app.ts and src/, so the
 // lifecycle stays byte-for-byte the starter's and cannot drift from what the env expects.)
+// (Authored note 2: nothing here sets an overall timeout or exits early on a transient failure.
+// The env's 900 s wall budget is the only deadline; exiting early on anything but a register 400/405
+// would forfeit the trial, so every failure mode above either retries forever or is a contract error.)
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
